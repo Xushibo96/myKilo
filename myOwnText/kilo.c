@@ -1,0 +1,1112 @@
+/*** includes ***/
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <termios.h>
+#include <time.h>
+
+/*** defines ***/
+#define KILO_VERSION "0.0.1"
+#define KILO_TAB_STOP 8
+#define KILO_QUIT_TIMES 3
+
+#define CTRL_KEY(k) ((k) & 0x1f)
+
+enum editorKey {
+    BACKSPACE = 127,
+    ARROW_LEFT = 1000,
+    ARROW_RIGHT,
+    ARROW_UP,
+    ARROW_DOWN,
+    HOME_KEY,
+    END_KEY,
+    DEL_KEY,
+    PAGE_UP,
+    PAGE_DOWN
+};
+
+enum editorHighlight {
+    HL_NORMAL = 0,
+    HL_COMMENT,
+    HL_MLCOMMENT,
+    HL_KEYWORD1,
+    HL_KEYWORD2,
+    HL_STRING,
+    HL_NUMBER,
+    HL_MATCH,
+};
+
+#define HL_HIGHLIGHT_NUMBERS (1<<0)
+#define HL_HIGHLIGHT_STRINGS (1<<1)
+
+/*** data ***/
+struct editorSyntax {
+    char* filetype;
+    char** filematch;
+    char** keywords;
+    char* singleline_comment_start;
+    char* multiline_comment_start;
+    char* multiline_comment_end;
+    int flags;
+};
+
+
+typedef struct erow {
+    int idx;
+    int size;
+    int rsize;
+    char* chars;
+    char* render;
+    unsigned char* hl;
+    int hl_open_comment;
+}erow;
+
+struct editorConfig {
+    int cx, cy;
+    int rx;
+    int rowoff;
+    int coloff;
+    int screenrows;
+    int screencols;
+    int numrows;
+    erow* row;
+    int dirty;
+    char* filename;
+    char statusmsg[80];
+    time_t statusmsg_time;
+    struct editorSyntax* syntax;
+    struct termios orig_termios;
+};
+
+struct editorConfig E;
+
+/*** filetypes ***/
+
+char* C_HL_extensions[] = { ".c",".h",".cpp", NULL };
+
+char* C_HL_keywords[] = {
+  "switch", "if", "while", "for", "break", "continue", "return", "else",
+  "struct", "union", "typedef", "static", "enum", "class", "case",
+  "int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|",
+  "void|", NULL
+};
+
+struct editorSyntax HLDB[] = {
+    {
+        "c",
+        C_HL_extensions,
+        C_HL_keywords,
+        "//","/*","*/",
+        HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+    },
+};
+
+#define HLDB_ENTRIES (sizeof(HLDB)/sizeof(HLDB[0]))
+
+/*** prototypes ***/
+void editorSetStatusMessage(const char* fmt, ...);
+void editorRefreshScreen();
+char* editorPrompt(char* promot, void (*callback)(char*, int));
+
+/*** terminal ***/
+
+void die(const char* s) {
+    write(STDOUT_FILENO, "\x1b[2j", 4);
+    write(STDOUT_FILENO, "\x1b[H", 3);
+    perror(s);
+    exit(1);
+}
+
+void disableRawMode() {
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1)
+        die("tcsetattr");
+}
+
+void enableRawMode() {
+    if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1) die("tcgetattr");
+    // 通过tcgetattr获得状态保存到结构体中
+    atexit(disableRawMode);
+    // stdlib中的函数，在main结束或者调用exit()后自动运行一些函数
+
+    struct termios raw = E.orig_termios;
+    // raw这个termios的结构体复制当前终端状态
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= ~(OPOST);
+    raw.c_cflag |= (CS8);
+    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+    // ECHO是个标志，对他取反并且按位与，保证只echo那一位取反了
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 1;
+
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
+    // 通过tcsetattr把修改后的终端标志位写回去
+}
+
+int editorReadKey() {
+    int nread;
+    char c;
+    while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+        if (nread == -1 && errno != EAGAIN) die("read");
+    }
+
+    if (c == '\x1b') {
+        char seq[3];
+
+        if (read(STDIN_FILENO, &seq[0], 1) != 1) return '\x1b';
+        if (read(STDIN_FILENO, &seq[1], 1) != 1) return '\x1b';
+
+        if (seq[0] == '[') {
+            if (seq[1] >= '0' && seq[1] <= '9') {
+                if (read(STDIN_FILENO, &seq[2], 1) != 1) return '\x1b';
+                if (seq[2] == '~') {
+                    switch (seq[1]) {
+                    case '1': return HOME_KEY;
+                    case '3': return DEL_KEY;
+                    case '4': return END_KEY;
+                    case '5': return PAGE_UP;
+                    case '6': return PAGE_DOWN;
+                    case '7': return HOME_KEY;
+                    case '8': return END_KEY;
+                    }
+                }
+            } else {
+                switch (seq[1]) {
+                case 'A': return ARROW_UP;
+                case 'B': return ARROW_DOWN;
+                case 'C': return ARROW_RIGHT;
+                case 'D': return ARROW_LEFT;
+                case 'H': return HOME_KEY;
+                case 'F': return END_KEY;
+                }
+            }
+        } else if (seq[0] == '0') {
+            switch (seq[1]) {
+            case 'H': return HOME_KEY;
+            case 'F': return END_KEY;
+            }
+        }
+        return '\x1b';
+    } else {
+        return c;
+    }
+}
+
+int getCursorPosition(int* rows, int* cols) {
+    char buf[32];
+    unsigned int i = 0;
+
+    if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4) return -1;
+
+    while (i < sizeof(buf) - 1) {
+        if (read(STDIN_FILENO, &buf[i], 1) != 1) break;
+        if (buf[i] == 'R') break;
+        i++;
+    }
+    buf[i] = '\0';
+
+    if (buf[0] != '\x1b' || buf[1] != '[') return -1;
+    if (sscanf(&buf[2], "%d;%d", rows, cols) != 2) return -1;
+
+    return 0;
+}
+
+int getWindowSize(int* rows, int* cols) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+        if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12) return -1;
+        return getCursorPosition(rows, cols);
+    } else {
+        *cols = ws.ws_col;
+        *rows = ws.ws_row;
+        return 0;
+    }
+
+}
+
+/*** syntax highlighting ***/
+
+int is_separator(int c) {
+    return isspace(c) || c == '\0' || strchr(",.()+-*=~%<>[];", c) != NULL;
+}
+
+void editorUpdateSyntax(erow* row) {
+    row->hl = realloc(row->hl, row->rsize);
+    memset(row->hl, HL_NORMAL, row->rsize);
+
+    if (E.syntax == NULL)  return;
+
+    char** keywords = E.syntax->keywords;
+
+    char* scs = E.syntax->singleline_comment_start;
+    char* mcs = E.syntax->multiline_comment_start;
+    char* mce = E.syntax->multiline_comment_end;
+
+    int scs_len = scs ? strlen(scs) : 0;
+    int mcs_len = mcs ? strlen(mcs) : 0;
+    int mce_len = mce ? strlen(mce) : 0;
+
+    int prev_sep = 1;
+    int in_string = 0;
+    int in_comment = (row->idx > 0 && E.row[row->idx - 1].hl_open_comment);
+    // 是不是在多行注释里的初始值要看上一行是不是没完成的多行注释
+
+
+    int i = 0;
+    while (i < row->size) {
+        char c = row->render[i];
+        unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
+
+        if (scs_len && !in_string && !in_comment) {
+            if (!strncmp(&row->render[i], scs, scs_len)) {
+                memset(&row->hl[i], HL_COMMENT, row->rsize - i);
+                break;
+            }
+        }
+        if (mcs_len && mce_len && !in_string) {
+            if (in_comment) {
+                // 在注释内就一直找结尾
+                row->hl[i] = HL_MLCOMMENT;
+                if (!strncmp(&row->render[i], mce, mce_len)) {
+                    // 直到多行注释的结束之前
+                    memset(&row->hl[i], HL_MLCOMMENT, mce_len);
+                    i += mce_len;
+                    in_comment = 0;
+                    prev_sep = 1;
+                    continue;
+                } else {
+                    i++;
+                    continue;
+                }
+                // 不在注释内就一直找注释的开头
+            } else if (!strncmp(&row->render[i], mcs, mcs_len)) {
+                memset(&row->hl[i], HL_MLCOMMENT, mce_len);
+                i += mcs_len;
+                in_comment = 1;
+                continue;
+            }
+        }
+
+        if (E.syntax->flags & HL_HIGHLIGHT_STRINGS) {
+            if (in_string) {
+                // 在字符串内
+                row->hl[i] = HL_STRING;
+                // 带有‘\’的转义字符不能作为结束字符串的标记
+                if (c == '\\' && i + 1 < row->rsize) {
+                    row->hl[i + 1] = HL_STRING;
+                    i += 2; // 转义字符\ 和转义字符后面一个字符
+                    continue;
+                }
+                // 到达引号结束
+                if (c == in_string) in_string = 0;
+                i++;
+                prev_sep = 1;
+                continue;
+            } else {
+                // 不在字符串内，要检查是不是到了字符串内
+                if (c == '"' || c == '\'') {
+                    // 字符串开始通常用引号和单引号包围
+                    in_string = c;
+                    row->hl[i] = HL_STRING;
+                    i++;
+                    continue;
+                }
+            }
+        }
+
+
+        if (E.syntax->flags & HL_HIGHLIGHT_NUMBERS) {
+            if ((isdigit(c) && (prev_sep || prev_hl == HL_NUMBER)) ||
+                (c == '.' && prev_hl == HL_NUMBER)) {
+                row->hl[i] = HL_NUMBER;
+                i++;
+                prev_sep = 0;
+                continue;
+            }
+        }
+
+        if (prev_sep) {
+            int j;
+            for (j = 0; keywords[j]; j++) {
+                int klen = strlen(keywords[j]);
+                int kw2 = keywords[j][klen - 1] == '|';
+                if (kw2) klen--;
+                if (!strncmp(&row->render[i], keywords[j], klen) &&
+                    is_separator(row->render[i + klen])) {
+                    memset(&row->hl[i], kw2 ? HL_KEYWORD2 : HL_KEYWORD1, klen);
+                    i += klen;
+                    break;
+                }
+
+            }
+            if (keywords[j] != NULL) {
+                prev_sep = 0;
+                continue;
+            }
+
+        }
+
+        prev_sep = is_separator(c);
+        i++;
+    }
+    int changed = (row->hl_open_comment != in_comment);
+    row->hl_open_comment = in_comment;
+    if (changed && row->idx + 1 < E.numrows)
+        editorUpdateSyntax(&E.row[row->idx + 1]);
+}
+
+int editorSyntaxToColor(int hl) {
+    switch (hl) {
+    case HL_COMMENT:
+    case HL_MLCOMMENT: return 36;
+    case HL_KEYWORD1: return 32;
+    case HL_KEYWORD2: return 33;
+    case HL_STRING:return 35;
+    case HL_NUMBER: return 31;
+    case HL_MATCH: return 34;
+    default: return 37;
+    }
+}
+
+void editorSelectSyntaxHighlight() {
+    E.syntax = NULL;
+    if (E.filename == NULL) return;
+    char* ext = strrchr(E.filename, '.');
+    for (unsigned int j = 0; j < HLDB_ENTRIES; j++) {
+        struct editorSyntax* s = &HLDB[j];
+        unsigned int i = 0;
+        while (s->filematch[i]) {
+            int is_ext = (s->filematch[i][0] == '.');
+            if ((is_ext && ext && !strcmp(ext, s->filematch[i])) ||
+                (!is_ext && strstr(E.filename, s->filematch[i]))) {
+                E.syntax = s;
+
+                int filerow;
+                for (filerow = 0; filerow < E.numrows; filerow++) {
+                    editorUpdateSyntax(&E.row[filerow]);
+                }
+
+                return;
+            }
+            i++;
+        }
+    }
+}
+
+/*** row operations ***/
+
+int editorRowCxToRx(erow* row, int cx) {
+    // 计算rx
+    // 在cx之前的每一个字符，如果是tab的话rx得补齐到下一个KILO_TAB_STOP的倍数
+    int rx = 0;
+    int j;
+    for (j = 0; j < cx; j++) {
+        if (row->chars[j] == '\t')
+            rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+        // 先看现在rx除以8的余数，7减去这个余数就是就是要补多少
+        // 补齐到下一个制表位的左边
+        rx++;
+    }
+    return rx;
+}
+
+int editorRowRxToCx(erow* row, int rx) {
+    int cur_rx = 0;
+    int cx;
+    for (cx = 0; cx < row->size; cx++) {
+        if (row->chars[cx] == '\t')
+            cur_rx += (KILO_TAB_STOP - 1) - (cur_rx % KILO_TAB_STOP);
+        cur_rx++;
+
+        if (cur_rx > rx) return cx;
+    }
+    return cx;
+}
+
+void editorUpdateRow(erow* row) {
+    int tabs = 0;
+    int j;
+    for (j = 0; j < row->size; j++)
+        if (row->chars[j] == '\t') tabs++;
+    free(row->render);
+    row->render = malloc(row->size + tabs * (KILO_TAB_STOP - 1) + 1);
+    int idx = 0;
+    for (j = 0; j < row->size; j++) {
+        if (row->chars[j] == '\t') {
+            row->render[idx++] = ' ';
+            while (idx % KILO_TAB_STOP != 0) row->render[idx++] = ' ';
+        } else {
+            row->render[idx++] = row->chars[j];
+        }
+    }
+    row->render[idx] = '\0';
+    row->rsize = idx;
+    editorUpdateSyntax(row);
+}
+
+
+void editorInsertRow(int at, char* s, size_t len) {
+    if (at < 0 || at> E.numrows) return;
+
+    E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+    memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
+    for (int j = at + 1; j < E.numrows; j++) E.row[j].idx++;
+    E.row[at].idx = at;
+
+    E.row[at].size = len;
+    E.row[at].chars = malloc(len + 1);
+    memcpy(E.row[at].chars, s, len);
+    E.row[at].chars[len] = '\0';
+
+    E.row[at].rsize = 0;
+    E.row[at].render = NULL;
+    E.row[at].hl = NULL;
+    E.row[at].hl_open_comment = 0;
+    editorUpdateRow(&E.row[at]);
+
+    E.numrows++;
+    E.dirty++;
+}
+
+void editorFreeRow(erow* row) {
+    free(row->render);
+    free(row->chars);
+    free(row->hl);
+}
+
+void editorDelRow(int at) {
+    if (at < 0 || at >= E.numrows) return;
+    editorFreeRow(&E.row[at]);
+    memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
+    for (int j = at; j < E.numrows; j++) E.row[j].idx--;
+    E.numrows--;
+    E.dirty++;
+}
+
+void editorRowInsertChar(erow* row, int at, int c) {
+    if (at < 0 || at > row->size) at = row->size;
+    row->chars = realloc(row->chars, row->size + 2);
+    memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+    row->size++;
+    row->chars[at] = c;
+    editorUpdateRow(row);
+    E.dirty++;
+}
+
+void editorRowAppendString(erow* row, char* s, size_t len) {
+    // 重新分配内存保证空间够用
+    row->chars = realloc(row->chars, row->size + len + 1);
+    // 拷贝字符串
+    memcpy(&row->chars[row->size], s, len);
+    row->size += len;
+    row->chars[row->size] = '\0';
+    editorUpdateRow(row);
+    E.dirty++;
+}
+
+void editorRowDelChar(erow* row, int at) {
+    if (at < 0 || at >= row->size) return;
+    memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+    row->size--;
+    editorUpdateRow(row);
+    E.dirty++;
+}
+
+/*** editor operations ***/
+
+void editorInsertChar(int c) {
+    if (E.cy == E.numrows) {
+        editorInsertRow(E.numrows, "", 0);
+    }
+    editorRowInsertChar(&E.row[E.cy], E.cx, c);
+    E.cx++;
+}
+
+void editorInsertNewline() {
+    if (E.cx == 0) {
+        // 首行的话直接新添加一行即可
+        editorInsertRow(E.cy, "", 0);
+    } else {
+        //不是首行，要把当前行截断 光标后面的放到下一行
+        erow* row = &E.row[E.cy]; // 获得当前行
+        // 在下一行插入一行，内容是当前行从当前坐标开始的内容，大小为整个行大小减去当前坐标
+        editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+        // 重新获得一下当前行，因为插入新行的时候重新分配内存了，原来的指针可能失效
+        row = &E.row[E.cy];
+        // 把这行的大小重新设置，末尾放上结束标志
+        row->size = E.cx;
+        row->chars[row->size] = '\0';
+        editorUpdateRow(row);
+    }
+    // 光标指向下一行开头
+    E.cy++;
+    E.cx = 0;
+}
+
+void editorDelChar() {
+    // 光标超出文件末尾 立即返回
+    if (E.cy == E.numrows) return;
+    // 最左上角也直接返回
+    if (E.cx == 0 && E.cy == 0) return;
+    erow* row = &E.row[E.cy]; // 取到当前行
+    if (E.cx > 0) {
+        // 调用editorRowDelChar，删除当前行cx光标前一个字符
+        editorRowDelChar(row, E.cx - 1);
+        E.cx--;
+    } else {
+        E.cx = E.row[E.cy - 1].size;
+        // 把上一行地址和这一行的内容，这一行的大小输入到函数中
+        editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
+        editorDelRow(E.cy);
+        E.cy--;
+    }
+}
+
+
+/*** file i/o ***/
+char* editorRowsToString(int* buflen) {
+    int totlen = 0;
+    int j;
+    for (j = 0; j < E.numrows; j++)
+        totlen += E.row[j].size + 1; // 统计所有字符数，+1 加一个换行符
+    *buflen = totlen;
+
+    char* buf = malloc(totlen);
+    char* p = buf;
+    for (j = 0; j < E.numrows; j++) {
+        memcpy(p, E.row[j].chars, E.row[j].size);// 拷贝这一行的文件内容
+        p += E.row[j].size; // 移动指针，
+        *p = '\n'; // 后面加一个换行
+        p++; // 继续移动指针
+    }
+    return buf;
+}
+
+void editorOpen(char* filename) {
+    free(E.filename);
+    E.filename = strdup(filename);
+
+    editorSelectSyntaxHighlight();
+
+    FILE* fp = fopen(filename, "r");
+    if (!fp) die("fopen");
+    char* line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    while ((linelen = getline(&line, &linecap, fp)) != -1) {
+        while (linelen > 0 && (line[linelen - 1] == '\n' ||
+            line[linelen - 1] == '\r'))
+            linelen--;
+        editorInsertRow(E.numrows, line, linelen);
+    }
+    free(line);
+    fclose(fp);
+    E.dirty = 0;
+}
+
+void editorSave() {
+    if (E.filename == NULL) {
+        E.filename = editorPrompt("Save as : %s (ESC to cancel)", NULL);
+        if (E.filename == NULL) {
+            editorSetStatusMessage("Save aborted");
+            return;
+        }
+        editorSelectSyntaxHighlight();
+    }
+
+    int len;
+    char* buf = editorRowsToString(&len);
+
+    int fd = open(E.filename, O_RDWR | O_CREAT, 0664);
+    if (fd != -1) {
+        if (ftruncate(fd, len) != -1) {
+            if (write(fd, buf, len) == len) {
+                close(fd);
+                free(buf);
+                E.dirty = 0;
+                editorSetStatusMessage("%d bytes wirtten to disk", len);
+                return;
+            }
+        }
+        close(fd);
+    }
+
+    free(buf);
+    editorSetStatusMessage("Can't save! I/O Error:%s", strerror(errno));
+    E.filename = NULL;
+}
+
+/*** find ***/
+void editorFindCallback(char* query, int key) {
+    static int last_match = -1;
+    static int direction = 1;
+
+    static int saved_hl_line;
+    static char* saved_hl = NULL;
+
+    if (saved_hl) {
+        // 要是有已经保存过得 hl 给他还原回去
+        memcpy(E.row[saved_hl_line].hl, saved_hl, E.row[saved_hl_line].rsize);
+        free(saved_hl);
+        saved_hl = NULL;
+    }
+
+
+    if (key == '\r' || key == '\x1b') {
+        last_match = -1;
+        direction = 1;
+        return;
+    } else if (key == ARROW_RIGHT || key == ARROW_DOWN) {
+        direction = 1;
+    } else if (key == ARROW_LEFT || key == ARROW_UP) {
+        direction = -1;
+    } else {
+        last_match = -1;
+        direction = 1;
+    }
+    if (last_match == -1) direction = 1;
+    int current = last_match;
+    int i;
+    for (i = 0; i < E.numrows; i++) {
+        current += direction;
+        if (current == -1) current = E.numrows - 1;
+        else if (current == E.numrows) current = 0;
+
+        erow* row = &E.row[current];
+        char* match = strstr(row->render, query);
+        if (match) {
+            last_match = current;
+            E.cy = current;
+            E.cx = editorRowRxToCx(row, match - row->render);
+            E.rowoff = E.numrows;
+
+            saved_hl_line = current;
+            saved_hl = malloc(row->size);
+            memcpy(saved_hl, row->hl, row->rsize);
+            // 通过memset 将匹配到的字符hl属性都设置为34
+            memset(&row->hl[match - row->render], HL_MATCH, strlen(query));
+            break;
+        }
+    }
+}
+
+void editorFind() {
+    int saved_cx = E.cx;
+    int saved_cy = E.cy;
+    int saved_coloff = E.coloff;
+    int saved_rowoff = E.rowoff;
+
+    char* query = editorPrompt("Search %s (USE esc/Arrows/Enter)", editorFindCallback);
+    if (query == NULL) return;
+    if (query) {
+        free(query);
+    } else {
+        E.cx = saved_cx;
+        E.cy = saved_cy;
+        E.coloff = saved_coloff;
+        E.rowoff = saved_rowoff;
+    }
+}
+
+
+/*** append buffer ***/
+struct abuf {
+    char* b;
+    int len;
+};
+
+#define ABUF_INIT {NULL, 0}
+
+void abAppend(struct abuf* ab, const char* s, int len) {
+    char* new = realloc(ab->b, ab->len + len);
+
+    if (new == NULL) return;
+    memcpy(&new[ab->len], s, len);
+    ab->b = new;
+    ab->len += len;
+}
+
+void abFree(struct abuf* ab) {
+    free(ab->b);
+}
+
+/*** output ***/
+void editorScroll() {
+    E.rx = 0;
+    if (E.cy < E.numrows) {
+        E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
+    }
+
+
+    if (E.cy < E.rowoff) {
+        E.rowoff = E.cy;
+    }
+    if (E.cy >= E.rowoff + E.screenrows) {
+        E.rowoff = E.cy - E.screenrows + 1;
+    }
+    if (E.rx < E.coloff) {
+        // cx 表示整个要显示文档中的光标坐标，coloff表示屏幕的偏移量
+        // 当光标坐标 小于偏移量的时候， 偏移量就是光标坐标
+        E.coloff = E.cx;
+    }
+    if (E.rx >= E.coloff + E.screencols) {
+        // 当光标坐标大于偏移量+屏幕可以显示的最大宽度时
+        // 屏幕显示不全这一行了，所以要用光标坐标减去屏幕行数+1 得到偏移量
+        E.coloff = E.rx - E.screencols + 1;
+    }
+}
+
+
+void editorDrawRows(struct abuf* ab) {
+    int y;
+    for (y = 0; y < E.screenrows; y++) {
+        int filerow = y + E.rowoff;
+        if (filerow >= E.numrows) {
+            // 超出文件总行数之后显示波浪号
+            if (E.numrows == 0 && y == E.screenrows / 3) {
+                char welcome[80];
+                int welcomelen = snprintf(welcome, sizeof(welcome),
+                    "Kilo Editor -- version %s", KILO_VERSION);
+                if (welcomelen > E.screencols) welcomelen = E.screencols;
+                int padding = (E.screencols - welcomelen) / 2;
+                if (padding) {
+                    abAppend(ab, "~", 1);
+                    padding--;
+                }
+                while (padding--) abAppend(ab, " ", 1);
+
+                abAppend(ab, welcome, welcomelen);
+            } else {
+                abAppend(ab, "~", 1);
+            }
+        } else {
+            // 文件长度内 显示文件内容
+            int len = E.row[filerow].size - E.coloff;
+            if (len < 0)len = 0;
+            if (len > E.screencols) len = E.screencols;
+            char* c = &E.row[filerow].render[E.coloff];
+            unsigned char* hl = &E.row[filerow].hl[E.coloff];
+            int current_color = -1;
+            int j;
+            for (j = 0; j < len; j++) {
+                if (iscntrl(c[j])) {
+                    char sym = (c[j] <= 26) ? '@' + c[j] : '?';
+                    abAppend(ab, "\x1b[7m", 4);
+                    abAppend(ab, &sym, 1);
+                    abAppend(ab, "\x1b[m", 3);
+                    if (current_color != -1) {
+                        char buf[16];
+                        int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
+                        abAppend(ab, buf, clen);
+                    }
+                } else if (hl[j] == HL_NORMAL) {
+                    if (current_color != -1) {
+                        abAppend(ab, "\x1b[39m", 5);
+                        current_color = -1;
+                    }
+
+                    abAppend(ab, &c[j], 1);
+                } else {
+                    int color = editorSyntaxToColor(hl[j]);
+                    if (color != current_color) {
+                        current_color = color;
+                        char buf[16];
+                        int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
+                        abAppend(ab, buf, clen);
+                    }
+                    abAppend(ab, &c[j], 1);
+                }
+            }
+            abAppend(ab, "\x1b[39m", 5);
+        }
+
+        abAppend(ab, "\x1b[K", 3);
+        abAppend(ab, "\r\n", 2);
+    }
+}
+
+void editorDrawStatusBar(struct abuf* ab) {
+    abAppend(ab, "\x1b[7m", 4);
+    // 反色模式 画白色的底色
+
+    char status[80], rstatus[80];
+    int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
+        E.filename ? E.filename : "[No Name]", E.numrows,
+        E.dirty ? "Modified" : "");
+    // 下面一行同时实现把需要格式化rstatus的输出，打印文件行数和当前的行E.cy
+    // 以及 获得页码一共多长
+    int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d/%d",
+        E.syntax ? E.syntax->filetype : "no ft", E.cy + 1, E.numrows);
+    if (len > E.screencols) len = E.screencols;
+    abAppend(ab, status, len);
+    while (len < E.screencols) {
+        // len是status的长度
+        // 上面abAppend已经将status显示出去了
+        // 下面实现右对齐打印行数和当前行号，
+        // 一直到剩下的长度正好打印rstatus之前都补空格
+        if (E.screencols - len == rlen) {
+            abAppend(ab, rstatus, rlen);
+            break;
+        } else {
+            abAppend(ab, " ", 1);
+            len++;
+        }
+    }
+    abAppend(ab, "\x1b[m", 3);
+    // 退出反色模式
+    abAppend(ab, "\r\n", 2);
+}
+
+void editorDrawMessageBar(struct abuf* ab) {
+    abAppend(ab, "\x1b[K", 3);
+    int msglen = strlen(E.statusmsg);
+    if (msglen > E.screencols) msglen = E.screencols;
+    if (msglen && time(NULL) - E.statusmsg_time < 5)
+        abAppend(ab, E.statusmsg, msglen);
+}
+
+void editorRefreshScreen() {
+    editorScroll();
+
+    struct abuf ab = ABUF_INIT;
+
+    abAppend(&ab, "\x1b[?25l", 6);
+    abAppend(&ab, "\x1b[H", 3);
+    // 4 表示输入4个字节，第一个字节是\x1b 表示27 剩下三个是[2j
+    editorDrawRows(&ab);
+    editorDrawStatusBar(&ab);
+    editorDrawMessageBar(&ab);
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, (E.rx - E.coloff) + 1);
+    abAppend(&ab, buf, strlen(buf));
+    // 绘制光标
+    abAppend(&ab, "\x1b[?25h", 6);
+
+    write(STDOUT_FILENO, ab.b, ab.len);
+    abFree(&ab);
+}
+
+void editorSetStatusMessage(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
+    va_end(ap);
+    E.statusmsg_time = time(NULL);
+}
+
+/*** input ***/
+char* editorPrompt(char* promot, void (*callback)(char*, int)) {
+    size_t bufsize = 128;
+    char* buf = malloc(bufsize);
+
+    size_t buflen = 0;
+    buf[0] = '\0';
+
+    while (1) {
+        editorSetStatusMessage(promot, buf);
+        editorRefreshScreen();
+        // 读一个字符进来
+        int c = editorReadKey();
+        // 遇到回车并且buf里面有东西就停止显示提示并且返回buf
+        if (c == DEL_KEY || c == CTRL_KEY('h') || c == BACKSPACE) {
+            if (buflen != 0)  buf[--buflen] = '\0';
+        } else if (c == '\x1b') {
+            editorSetStatusMessage("");
+            if (callback) callback(buf, c);
+            free(buf);
+            return NULL;
+        } else if (c == '\r') {
+            if (buflen != 0) {
+                editorSetStatusMessage("");
+                if (callback) callback(buf, c);
+                return buf;
+            }
+            // 如果不是控制字符并且是正常的字母的话
+        } else if (!iscntrl(c) && c < 128) {
+            // buf快满了就扩大一下buf，重分配一下内存
+            if (buflen == bufsize - 1) {
+                bufsize *= 2;
+                buf = realloc(buf, bufsize);
+            }
+            // 给字符放里面，添加一个结束符
+            buf[buflen++] = c;
+            buf[buflen] = '\0';
+        }
+        if (callback) callback(buf, c);
+    }
+}
+
+void editorMoveCursor(int key) {
+    // row表示当前行里的内容，如果E.cy文档坐标大于总行数，那么这一行就是空
+    // 如果E.cy没大于总行数就用全局变量中的哪一行
+    erow* row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+
+    switch (key) {
+    case ARROW_LEFT:
+        if (E.cx != 0) {
+            E.cx--;
+        } else if (E.cy > 0) {
+            // 有下一行
+            // 移动到下一行的末尾
+            E.cy--;
+            E.cx = E.row[E.cy].size;
+        }
+
+        break;
+    case ARROW_RIGHT:
+        if (row && E.cx < row->size) {
+            // 限制向右移动，可以可以移动到当前行的末尾
+            E.cx++;
+        } else if (row && E.cx == row->size) {
+            // 不是最后一行 并且是最后一个一列
+            // 这时可以移动到上一行的第一列
+            E.cy++;
+            E.cx = 0;
+        }
+
+        break;
+    case ARROW_UP:
+        if (E.cy != 0) {
+            E.cy--;
+        }
+        break;
+    case ARROW_DOWN:
+        if (E.cy <= E.numrows) {
+            E.cy++;
+        }
+        break;
+    }
+    // 移动完光标之后有可能上一行比下一行长，
+    // 如果上一行比下一行长的话就把光标移到这一行的末尾
+    row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+    int rowlen = row ? row->size : 0;
+    if (E.cx > rowlen) {
+        E.cx = rowlen;
+    }
+
+}
+
+void editorProcessKeypress() {
+    static int quit_times = KILO_QUIT_TIMES;
+    int c = editorReadKey();
+    switch (c) {
+    case '\r':
+        editorInsertNewline();
+        break;
+    case CTRL_KEY('q'):
+        if (E.dirty && quit_times > 0) {
+            editorSetStatusMessage("WARNING!!! file has unsaved changes."
+                "Press Ctrl-Q %d More times to quit", quit_times);
+            quit_times--;
+            return;
+        }
+
+        write(STDOUT_FILENO, "\x1b[2J", 4);
+        write(STDOUT_FILENO, "\x1b[H", 3);
+        exit(0);
+        break;
+    case CTRL_KEY('s'):
+        editorSave();
+        break;
+    case HOME_KEY:
+        E.cx = 0;
+        break;
+
+    case END_KEY:
+        if (E.cy < E.numrows) {
+            E.cx = E.row[E.cy].size;
+        }
+        break;
+
+    case CTRL_KEY('f'):
+        editorFind();
+        break;
+    case BACKSPACE:
+    case CTRL_KEY('h'):
+    case DEL_KEY:
+        // TODO
+        if (c == DEL_KEY) editorMoveCursor(ARROW_RIGHT);
+        editorDelChar();
+        break;
+
+    case PAGE_UP:
+    case PAGE_DOWN:
+    {
+        if (c == PAGE_UP) {
+            E.cy = E.rowoff;
+        } else if (c == PAGE_DOWN) {
+            E.cy = E.rowoff + E.screenrows - 1;
+            if (E.cy > E.numrows) E.cy = E.numrows;
+        }
+
+        int times = E.screenrows;
+        while (times--) {
+            editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+        }
+    }
+    break;
+    case ARROW_UP:
+    case ARROW_DOWN:
+    case ARROW_LEFT:
+    case ARROW_RIGHT:
+        editorMoveCursor(c);
+        break;
+
+    case CTRL_KEY('l'):
+    case '\x1b':
+        break;
+    default:
+        editorInsertChar(c);
+        break;
+    }
+
+    quit_times = KILO_QUIT_TIMES;
+}
+
+
+/*** init ***/
+void intiEditor() {
+    E.cx = 0;
+    E.cy = 0;
+    E.rx = 0;
+    E.numrows = 0;
+    E.row = NULL;
+    E.rowoff = 0;
+    E.coloff = 0;
+    E.dirty = 0;
+    E.filename = NULL;
+    E.statusmsg[0] = '\0';
+    E.statusmsg_time = 0;
+    E.syntax = NULL;
+
+    if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
+    E.screenrows -= 2;
+}
+
+int main(int argc, char* argv[]) {
+    enableRawMode();
+    intiEditor();
+    if (argc >= 2) {
+        editorOpen(argv[1]);
+    }
+
+    editorSetStatusMessage("HELP: CTRL-q = quit |CTRL-f = find| CTRL-s = SAVE");
+
+    // 现在整个程序就是一直在刷新屏幕、读取输入
+    while (1) {
+        editorRefreshScreen();
+        editorProcessKeypress();
+    }
+    return 0;
+}
